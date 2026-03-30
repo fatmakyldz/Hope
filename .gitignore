@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data
+data/cifar-100-python/
+data/cifar-100-python.tar.gz
+data/*.tar.gz
+
+# Results (large experiment outputs)
+results/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/

@@ -1,11 +1,14 @@
 """
-HOPEModel: ResNet18 + 4-level CMS + Linear classifier.
+HOPEModel: ResNet18 + 4 Kademeli CMS + Lineer Sınıflandırıcı
 
-Two-pass interface (faithful to nested_learning):
-  Pass-1: logits, features = model(x)
-  Teach:  teach = compute_teach_signal(features, logits, labels, classifier)
-  Pass-2: model.cms.update(features, teach)   # fast weight update only
-  Meta:   loss.backward(); optimizer.step()   # backbone + classifier
+HOPE (Hierarchical Online Plasticity Engine), iki aşamalı bir eğitim döngüsü kullanır:
+
+  Geçiş-1 (Meta İleri):   logits, features = model(x)
+  Öğretme Sinyali:         teach = compute_teach_signal(features, logits, labels, classifier)
+  Geçiş-2 (CMS Güncelle): model.cms.update(features, teach)   # sadece hızlı ağırlıklar
+  Meta Geri Yayılım:       loss.backward(); optimizer.step()  # backbone + sınıflandırıcı
+
+Bu iki aşamalı yapı, CMS'nin meta optimizer'dan bağımsız öğrenmesini sağlar.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from .backbone import ResNetBackbone
 from .cms import CMSModule
 
 
+# ─── ÖĞRETME SİNYALİ (TEACH SIGNAL) ────────────────────────────────────────
 def compute_teach_signal(
     features: Tensor,
     logits: Tensor,
@@ -25,27 +29,39 @@ def compute_teach_signal(
     classifier: nn.Linear,
 ) -> Tensor:
     """
-    Closed-form CE gradient w.r.t. features.
+    Cross-Entropy kaybının özellik vektörlerine göre kapalı-form gradyanı.
 
-    Derivation:
-        grad_logits  = (softmax(logits) - one_hot(labels)) / B
-        grad_features = grad_logits @ W    [W: classifier.weight (C, D)]
-        teach = -grad_features             (improvement = negative gradient)
+    Matematiksel türetme:
+        grad_logits   = (softmax(logits) - one_hot(labels)) / B   # CE'nin logit gradyanı
+        grad_features = grad_logits @ W    [W: sınıflandırıcı ağırlığı (C, D)]
+        teach         = -grad_features     (iyileştirme = negatif gradyan yönü)
 
-    No autograd call -- safe inside torch.no_grad().
-    Faithful to nested_learning/training.py compute_teach_signal().
+    Bu hesaplama autograd kullanmaz; torch.no_grad() içinde güvenle çağrılabilir.
+    nested_learning/training.py'deki compute_teach_signal() ile birebir aynıdır.
+
+    Neden bu yöntemi kullanıyoruz?
+    - Geri yayılım yapmadan CMS'nin öğrenmesini sağlar (hızlı ve verimli).
+    - Model parametrelerini bozmadan yalnızca CMS hızlı ağırlıklarını günceller.
     """
     with torch.no_grad():
         B = features.size(0)
-        p = torch.softmax(logits.detach(), dim=-1)           # (B, C)
-        p[torch.arange(B, device=p.device), labels] -= 1.0  # subtract one-hot
-        p = p / B
-        W = classifier.weight.detach()                       # (C, D)
-        teach = -(p @ W)                                     # (B, D)
+        p = torch.softmax(logits.detach(), dim=-1)           # (B, C) — sınıf olasılıkları
+        p[torch.arange(B, device=p.device), labels] -= 1.0  # one-hot çıkar → gradyan
+        p = p / B                                            # batch ortalaması
+        W = classifier.weight.detach()                       # (C, D) — sınıflandırıcı ağırlığı
+        teach = -(p @ W)                                     # (B, D) — öğretme yönü
     return teach
 
 
+# ─── ANA MODEL ───────────────────────────────────────────────────────────────
 class HOPEModel(nn.Module):
+    """
+    Üç bileşenli HOPE modeli:
+      1. backbone  : ResNet18 — ham görüntüden 512 boyutlu özellik çıkarır
+      2. cms       : 4 kademeli CMS — özellikleri hızlı/yavaş bellek ile dönüştürür
+      3. classifier: Lineer katman — CMS çıkışından sınıf tahmini yapar
+    """
+
     def __init__(
         self,
         num_classes: int = 100,
@@ -61,21 +77,32 @@ class HOPEModel(nn.Module):
             hidden_multiplier=cms_hidden_multiplier,
             grad_clip=cms_grad_clip,
         )
+        # 512 boyutlu CMS çıkışını 100 sınıfa eşleyen lineer katman
         self.classifier = nn.Linear(self.backbone.feature_dim, num_classes)
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        """Returns (logits, backbone_features)."""
-        features = self.backbone(x)          # (B, 512)
-        cms_out = self.cms(features)          # (B, 512)
-        logits = self.classifier(cms_out)     # (B, num_classes)
+        """
+        İleri geçiş — iki değer döndürür:
+          logits  : (B, num_classes) — sınıf skorları (sınıflandırıcı çıkışı)
+          features: (B, 512)         — backbone çıkışı (öğretme sinyali için gerekli)
+
+        Not: features backbone çıkışıdır, CMS çıkışı değil.
+        Bu sayede öğretme sinyali hesaplanırken CMS'nin kendi gradyanları karışmaz.
+        """
+        features = self.backbone(x)      # (B, 512) — ham görüntü özellikleri
+        cms_out = self.cms(features)     # (B, 512) — bellek dönüşümü uygulanmış özellikler
+        logits = self.classifier(cms_out) # (B, 100) — sınıf skorları
         return logits, features
 
     def update_cms(self, features: Tensor, teach: Tensor) -> None:
-        """Pass-2: update CMS fast weights."""
+        """Geçiş-2: öğretme sinyaliyle CMS hızlı ağırlıklarını günceller."""
         self.cms.update(features.detach(), teach.detach())
 
     def meta_parameters(self) -> list[nn.Parameter]:
-        """Parameters for the meta optimizer (backbone + classifier, NOT CMS)."""
+        """
+        Meta optimizer için parametreler: backbone + sınıflandırıcı.
+        CMS hızlı parametreleri HARİÇ tutulur — onlar DeepMomentum ile güncellenir.
+        """
         cms_ids = {id(p) for p in self.cms.all_fast_params()}
         return [p for p in self.parameters() if id(p) not in cms_ids]
 
@@ -84,6 +111,11 @@ class HOPEModel(nn.Module):
         backbone_lr: float = 1e-4,
         classifier_lr: float = 1e-3,
     ) -> list[dict]:
+        """
+        Backbone ve sınıflandırıcı için farklı öğrenme hızı grupları.
+        Backbone çok küçük LR alır (önceden öğrenilmiş ağırlıkları bozmamak için).
+        Sınıflandırıcı daha büyük LR alır (her task'ta yeni sınıflar eklendiği için).
+        """
         cms_ids = {id(p) for p in self.cms.all_fast_params()}
         backbone_params, cls_params = [], []
         for name, p in self.named_parameters():
@@ -101,5 +133,9 @@ class HOPEModel(nn.Module):
         return groups
 
     def on_task_boundary(self) -> None:
-        """Reset fast+mid CMS levels at task boundary."""
+        """
+        Görev sınırında çağrılır: fast + mid CMS kademe ağırlıklarını sıfırlar.
+        slow + ultra korunur — bunlar uzun vadeli belleği temsil eder.
+        Bu, nested_learning'in temel tasarım kararıdır.
+        """
         self.cms.reset_fast()

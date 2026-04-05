@@ -1,19 +1,25 @@
 """
-CMS -- Continual Memory System (4-level hierarchical fast memory).
+CMS — Continual Memory System (Sürekli Bellek Sistemi)
 
-Faithful port of nested_learning/src/nested_learning/cms.py
+HOPE'un kalbi olan bu modül, 4 kademeli hiyerarşik bir bellek yapısı kurar.
+Her kademe farklı hızda güncellenir: hızlı olanlar yeni bilgiyi anında alır,
+yavaş olanlar ise uzun vadeli bilgiyi korur.
 
-Architecture per level:
-    y = x + clip(Linear(GELU(Linear(LayerNorm(x)))))   # residual MLP
+Kademe hiyerarşisi (fast → mid → slow → ultra):
+    x0 = backbone özellikleri   (512 boyut)
+    x1 = fast(x0)               her adımda güncellenir   (period: 1)
+    x2 = mid(x1)                her 4 adımda güncellenir (period: 4)
+    x3 = slow(x2)               her 32 adımda güncellenir
+    x4 = ultra(x3)              her 128 adımda güncellenir
 
-4 levels (fast->mid->slow->ultra) cascade:
-    x0 = backbone_features
-    x1 = fast(x0)    updated every step
-    x2 = mid(x1)     updated every 4 steps
-    x3 = slow(x2)    updated every 32 steps
-    x4 = ultra(x3)   updated every 128 steps
+Her kademe bir residual MLP bloğudur:
+    y = x + clip(Linear(GELU(Linear(LayerNorm(x)))))
 
-Each level has its own DeepMomentum optimizer for fast weight updates.
+Neden bu mimari?
+- Fast: mevcut görevdeki ani değişimlere hızla uyum sağlar
+- Mid: görev içi orta vadeli örüntüleri yakalar
+- Slow: görevler arası geçişte bilgiyi korur
+- Ultra: tüm görevler boyunca birikmiş uzun vadeli belleği tutar
 """
 from __future__ import annotations
 
@@ -24,15 +30,18 @@ from torch import Tensor
 from optim.deep_momentum import DeepMomentum
 
 
-# -- Update periods (matches nested_learning pilot.yaml) ----------------------
+# ─── GÜNCELLEME PERİYOTLARI ─────────────────────────────────────────────────
+# Her kademe kaç adımda bir güncelleneceğini belirtir.
+# nested_learning pilot.yaml'dan alınmıştır.
 PERIODS = {
-    "fast":  1,
-    "mid":   4,
-    "slow":  32,
-    "ultra": 128,
+    "fast":  1,    # her adımda
+    "mid":   4,    # her 4 adımda bir
+    "slow":  32,   # her 32 adımda bir
+    "ultra": 128,  # her 128 adımda bir
 }
 
-# -- LR per level (all same in nested_learning cms_opt) -----------------------
+# ─── ÖĞRENME HIZLARI ─────────────────────────────────────────────────────────
+# CMS güncelleme hızları (meta optimizer'dan bağımsız)
 LR = {
     "fast":  4e-4,
     "mid":   4e-4,
@@ -41,113 +50,145 @@ LR = {
 }
 
 
+# ─── TEK KADEME BLOĞU ────────────────────────────────────────────────────────
 class CMSBlock(nn.Module):
-    """Single CMS residual MLP block (one level)."""
+    """
+    Tek CMS kademesinin residual MLP bloğu.
+
+    Yapı: y = x + clip(Linear(GELU(Linear(LayerNorm(x)))))
+
+    LayerNorm: gradyan patlamalarını önler, eğitimi kararlı tutar
+    GELU: ReLU'ya göre daha düzgün gradyan akışı sağlar
+    Residual bağlantı: girdiyi olduğu gibi çıktıya ekler → bilgi kaybolmaz
+    Gradient clip: büyük güncellemeleri sınırlar → kararlı öğrenme
+    """
 
     def __init__(self, dim: int, hidden_multiplier: int = 4, grad_clip: float = 1.0) -> None:
         super().__init__()
-        hidden = dim * hidden_multiplier
+        hidden = dim * hidden_multiplier  # gizli katman boyutu: 512 × 4 = 2048
         self.norm = nn.LayerNorm(dim)
         self.net = nn.Sequential(
-            nn.Linear(dim, hidden),
+            nn.Linear(dim, hidden),   # genişletme: 512 → 2048
             nn.GELU(),
-            nn.Linear(hidden, dim),
+            nn.Linear(hidden, dim),   # daraltma: 2048 → 512
         )
         self.grad_clip = grad_clip
 
     def forward(self, x: Tensor) -> Tensor:
-        delta = self.net(self.norm(x))
+        delta = self.net(self.norm(x))   # öğrenilmiş dönüşüm
+        # Eğitim sırasında büyük delta değerlerini sınırla
         if self.training and self.grad_clip > 0:
             with torch.no_grad():
                 nv = delta.norm(dim=-1, keepdim=True).clamp(min=self.grad_clip)
                 scale = nv / self.grad_clip
             delta = delta / scale
-        return x + delta
+        return x + delta  # residual bağlantı: girdiyi koru, sadece küçük düzeltme ekle
 
     def fast_params(self) -> list[nn.Parameter]:
+        """Bu kademenin hızlı ağırlıkları (meta optimizer tarafından güncellenmez)."""
         return list(self.net.parameters()) + list(self.norm.parameters())
 
 
+# ─── 4 KADEMELİ CMS MODÜLÜ ───────────────────────────────────────────────────
 class CMSModule(nn.Module):
     """
-    4-level CMS: fast -> mid -> slow -> ultra.
+    4 kademeli CMS: fast → mid → slow → ultra zincirleme çalışır.
 
-    Fast weights updated via teach_signal (deep momentum).
-    Meta optimizer never touches these parameters.
+    Önemli ayrım:
+    - İleri geçiş (forward): tüm kademe çıkışlarını hesaplar, ağırlık güncellenmez
+    - Güncelleme (update): öğretme sinyaliyle seçili kademelerin ağırlıklarını değiştirir
+    - Meta optimizer bu parametrelere hiç dokunmaz
     """
 
     def __init__(self, dim: int = 512, hidden_multiplier: int = 4, grad_clip: float = 1.0) -> None:
         super().__init__()
         self.dim = dim
+        # 4 kademeyi isimli bir ModuleDict içinde sakla
         self.levels = nn.ModuleDict({
             name: CMSBlock(dim, hidden_multiplier, grad_clip)
             for name in ("fast", "mid", "slow", "ultra")
         })
-        # Per-level deep momentum optimizers (NOT nn.Module, not saved in state_dict)
+        # Her kademe için bağımsız DeepMomentum optimizer
+        # (nn.Module değil — PyTorch state_dict'e dahil edilmez)
         self._opts: dict[str, DeepMomentum] = {
             name: DeepMomentum() for name in ("fast", "mid", "slow", "ultra")
         }
-        self._global_step: int = 0
+        self._global_step: int = 0  # kaç kez update() çağrıldığını sayar
 
-    # -- Forward --------------------------------------------------------------
-
+    # ─── İLERİ GEÇİŞ ─────────────────────────────────────────────────────────
     def forward(self, x: Tensor) -> Tensor:
-        """Cascade all 4 levels. No weight update here."""
+        """
+        4 kademeyi sırayla uygular.
+        Her kademenin çıkışı bir sonrakinin girişi olur (zincirleme).
+        Ağırlık güncellenmez — sadece ileri hesaplama.
+        """
         for name in ("fast", "mid", "slow", "ultra"):
             x = self.levels[name](x)
         return x
 
-    # -- Fast weight update ---------------------------------------------------
-
+    # ─── HIZLI AĞIRLIK GÜNCELLEMESİ ─────────────────────────────────────────
     @torch.no_grad()
     def update(self, x: Tensor, teach_signal: Tensor) -> None:
         """
-        Update CMS fast weights using teach_signal.
+        Öğretme sinyaliyle CMS hızlı ağırlıklarını günceller (Geçiş-2).
 
-        For each level that 'should update' at this step:
-            loss = -mean(teach_signal * delta)   # alignment loss
-            grad = autograd(loss, level.params)
-            param += -lr * deep_momentum(grad)
+        Her kademe için periyot dolmuşsa:
+            kayıp = -mean(teach_signal × delta)   # hizalama kaybı
+            grad  = autograd(kayıp, kademe.parametreler)
+            param += -lr × deep_momentum(grad)    # Adam benzeri güncelleme
 
-        Matches nested_learning/memorize.py memorize_tokens() inner loop.
+        Bu yöntem nested_learning/memorize.py'deki memorize_tokens() ile aynıdır.
+
+        Neden negatif kayıp?
+        Öğretme sinyali "özelliğin hangi yönde iyileşmesi gerektiğini" gösterir.
+        delta'yı bu yönle hizalamak (çarpım maksimize etmek) kaybı minimize eder.
         """
         self._global_step += 1
-        h = x  # input to first level
+        h = x  # ilk kademeye giren özellik vektörü
 
         for name in ("fast", "mid", "slow", "ultra"):
             level = self.levels[name]
             period = PERIODS[name]
             lr = LR[name]
 
+            # Bu kademe bu adımda güncellenmeli mi?
             if self._global_step % period == 0:
                 with torch.enable_grad():
+                    # Gradient hesaplamak için geçici olarak enable_grad aç
                     h_detached = h.detach().requires_grad_(False)
                     delta = level.net(level.norm(h_detached))
+                    # Hizalama kaybı: öğretme sinyali ile delta ne kadar uyuşuyor?
                     loss = -(teach_signal.detach() * delta).mean()
                 grads = torch.autograd.grad(loss, level.net.parameters(), allow_unused=True)
                 opt = self._opts[name]
                 for param, grad in zip(level.net.parameters(), grads):
                     if grad is not None:
-                        opt.step(param, grad, lr)
+                        opt.step(param, grad, lr)  # DeepMomentum ile güncelle
 
-            # Advance h through this level (no_grad, just forward)
+            # h'yi bu kademe üzerinden ilerlet (sadece ileri hesaplama)
             h = h + level.net(level.norm(h)).detach()
 
-    # -- Task boundary --------------------------------------------------------
-
+    # ─── GÖREV SINIRI İŞLEMLERİ ──────────────────────────────────────────────
     def reset_fast(self) -> None:
-        """Reset fast+mid weights and optimizers (call at task boundary)."""
+        """
+        Görev sınırında fast + mid kademelerini sıfırlar.
+        slow + ultra korunur → uzun vadeli bellek bozulmaz.
+
+        Bu, HOPE'un temel unutmama mekanizmasıdır:
+        - Hızlı kademeler yeni göreve sıfırdan başlar (yeni göreve uyum)
+        - Yavaş kademeler birikmiş bilgiyi korur (eski görevleri hatırlama)
+        """
         for name in ("fast", "mid"):
             block = self.levels[name]
             for m in block.net.modules():
                 if isinstance(m, nn.Linear):
-                    nn.init.zeros_(m.weight)
+                    nn.init.zeros_(m.weight)  # ağırlıkları sıfırla
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
-            self._opts[name].reset()
+            self._opts[name].reset()  # momentum durumunu da sıfırla
 
     def reset_all(self) -> None:
-        """Reset all levels (for ablation)."""
+        """Tüm kademeleri sıfırlar (ablasyon deneyi için)."""
         for name in ("fast", "mid", "slow", "ultra"):
             block = self.levels[name]
             for m in block.net.modules():
@@ -159,7 +200,7 @@ class CMSModule(nn.Module):
         self._global_step = 0
 
     def all_fast_params(self) -> list[nn.Parameter]:
-        """All CMS parameters -- excluded from meta optimizer."""
+        """Tüm CMS parametreleri — meta optimizer'a verilmez."""
         params = []
         for level in self.levels.values():
             params.extend(level.fast_params())

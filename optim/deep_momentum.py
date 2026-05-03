@@ -86,3 +86,30 @@ class DeepMomentum:
         self._m1.clear()
         self._m2.clear()
         self._step.clear()
+
+    def state_dict(self, params: list) -> dict:
+        """
+        Checkpoint için durum bilgisini serileştirilebilir formata çevirir.
+
+        id(param) yerine parametre indeksini kullanır: model yeniden yüklenince
+        bellek adresleri değişir ama sıra korunur.
+        """
+        m1_list, m2_list, step_list = [], [], []
+        for param in params:
+            pid = id(param)
+            m1_list.append(self._m1[pid].clone() if pid in self._m1 else None)
+            m2_list.append(self._m2[pid].clone() if pid in self._m2 else None)
+            step_list.append(self._step.get(pid, 0))
+        return {"m1": m1_list, "m2": m2_list, "step": step_list}
+
+    def load_state_dict(self, state: dict, params: list) -> None:
+        """
+        Checkpoint'ten durum bilgisini geri yükler.
+        Parametre indekslerini mevcut id(param)'lara eşler.
+        """
+        for i, param in enumerate(params):
+            pid = id(param)
+            if state["m1"][i] is not None:
+                self._m1[pid] = state["m1"][i]
+                self._m2[pid] = state["m2"][i]
+                self._step[pid] = state["step"][i]

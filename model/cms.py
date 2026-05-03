@@ -159,9 +159,12 @@ class CMSModule(nn.Module):
                     delta = level.net(level.norm(h_detached))
                     # Hizalama kaybı: öğretme sinyali ile delta ne kadar uyuşuyor?
                     loss = -(teach_signal.detach() * delta).mean()
-                grads = torch.autograd.grad(loss, level.net.parameters(), allow_unused=True)
+                # DÜZELTİLDİ: net + norm parametrelerinin ikisi de güncelleniyor.
+                # Önceden sadece net.parameters() kullanılıyordu → norm.weight/bias ölü kalıyordu.
+                all_params = list(level.net.parameters()) + list(level.norm.parameters())
+                grads = torch.autograd.grad(loss, all_params, allow_unused=True)
                 opt = self._opts[name]
-                for param, grad in zip(level.net.parameters(), grads):
+                for param, grad in zip(all_params, grads):
                     if grad is not None:
                         opt.step(param, grad, lr)  # DeepMomentum ile güncelle
 
@@ -205,3 +208,43 @@ class CMSModule(nn.Module):
         for level in self.levels.values():
             params.extend(level.fast_params())
         return params
+
+    def sync_params(self, world_size: int) -> None:
+        """
+        Dağıtık eğitimde CMS parametrelerini tüm node'larda eşitler.
+
+        DDP backbone+classifier gradyanlarını otomatik senkronlar ama
+        CMS DeepMomentum ile güncellenir (autograd dışı) → manuel all_reduce gerekir.
+        Her parametre tüm node'ların toplamının ortalamasına ayarlanır.
+
+        Sadece torch.distributed başlatılmışsa çalışır.
+        """
+        import torch.distributed as dist
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        with torch.no_grad():
+            for param in self.parameters():
+                dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
+                param.data /= world_size
+
+    def cms_state_dict(self) -> dict:
+        """
+        CMS parametreleri + DeepMomentum durumlarını checkpoint'e yazar.
+        Model ağırlıkları model.state_dict() ile ayrıca kaydedilir;
+        bu metot sadece DeepMomentum optimizer durumlarını içerir.
+        """
+        opt_states = {}
+        for name in ("fast", "mid", "slow", "ultra"):
+            level = self.levels[name]
+            all_params = list(level.net.parameters()) + list(level.norm.parameters())
+            opt_states[name] = self._opts[name].state_dict(all_params)
+        return {"opt_states": opt_states, "global_step": self._global_step}
+
+    def cms_load_state_dict(self, state: dict) -> None:
+        """Checkpoint'ten CMS optimizer durumlarını geri yükler."""
+        self._global_step = state.get("global_step", 0)
+        for name in ("fast", "mid", "slow", "ultra"):
+            if name in state.get("opt_states", {}):
+                level = self.levels[name]
+                all_params = list(level.net.parameters()) + list(level.norm.parameters())
+                self._opts[name].load_state_dict(state["opt_states"][name], all_params)

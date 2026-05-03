@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import Optimizer
 
-from model.hope_model import HOPEModel, compute_teach_signal
+from model.hope_model import HOPEModel
 
 
 # ─── ANA EĞİTİM FONKSİYONU ───────────────────────────────────────────────────
@@ -39,6 +39,7 @@ def train_one_epoch(
     replay_batch: int = 32,    # her adımda replay'den kaç örnek alınacak
     replay_weight: float = 1.0, # replay kaybının ağırlığı
     dynamic_replay: bool = True, # eski sınıf sayısıyla orantılı replay büyüklüğü
+    cms_sync_fn=None,          # dağıtık eğitimde CMS senkronizasyon callback'i
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -56,14 +57,10 @@ def train_one_epoch(
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
 
-        # ─── BUFFER'A EKLE ────────────────────────────────────────────────────
-        # Eğitimden önce ekliyoruz: mevcut batch'i "daha sonra replay için" sakla.
-        # Eğitim bitmeden önce eklemek bias oluşturmaz (henüz öğrenilmedi).
-        if buffer is not None:
-            buffer.add(images, labels)
-
         # ─── REPLAY İLE BATCH BİRLEŞTİR ──────────────────────────────────────
-        # Mevcut göreve ait görüntüler + eski görevlerden replay görüntüleri
+        # DÜZELTİLDİ: Önce eski örnekleri çek, sonra mevcut batch'i ekle.
+        # Önceki sıra (önce add, sonra sample) mevcut batch'in kendi replay'ine
+        # karışmasına yol açıyordu.
         if buffer is not None and len(buffer) > 0:
             rep_imgs, rep_lbls = buffer.sample(effective_replay, device)
             if rep_imgs is not None:
@@ -75,8 +72,12 @@ def train_one_epoch(
         else:
             all_imgs, all_lbls, n_cur = images, labels, images.size(0)
 
+        # Mevcut batch'i sample'dan sonra buffer'a ekle (aynı batch replay'e karışmasın)
+        if buffer is not None:
+            buffer.add(images, labels)
+
         # ─── GEÇİŞ-1: META İLERİ HESAPLAMA ──────────────────────────────────
-        logits, features = model(all_imgs)  # (B+replay, C), (B+replay, 512)
+        logits, backbone_feat, cms_out = model(all_imgs)
 
         # Mevcut görev kaybı (normal ağırlık)
         cur_loss = F.cross_entropy(logits[:n_cur], all_lbls[:n_cur])
@@ -88,30 +89,36 @@ def train_one_epoch(
         else:
             loss = cur_loss
 
+        # ─── ÖĞRETME SİNYALİ HAZIRLA (backward'dan önce W snapshot'ı al) ─────
+        # W backward'dan önce klonlanır: logits bu W ile hesaplandı → teach tutarlı.
+        # CMS update backward'dan SONRA yapılır → in-place değişiklik graph'ı bozmaz.
+        if run_teach:
+            with torch.no_grad():
+                W_snap = model.classifier.weight.detach().clone()
+                B_cur = backbone_feat[:n_cur].size(0)
+                p = torch.softmax(logits[:n_cur].detach(), dim=-1)
+                p[torch.arange(B_cur, device=p.device), all_lbls[:n_cur]] -= 1.0
+                p = p / B_cur
+                teach = -(p @ W_snap)  # (B, dim) — öğretme yönü
+
         # ─── META GERİ YAYILIM ────────────────────────────────────────────────
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
 
         # Gradient maskeleme: sınıflandırıcı sadece görülen sınıflar için güncellenir.
-        # Görülmemiş sınıfların ağırlıkları dokunulmadan kalır (0 başlangıç değerini korur).
         _mask_classifier_grads(model.classifier, current_class_ids, device)
 
         # Gradient patlamalarını önlemek için norm kırpma
         torch.nn.utils.clip_grad_norm_(model.meta_parameters(), max_norm=1.0)
         optimizer.step()
 
-        # ─── GEÇİŞ-2: ÖĞRETME SİNYALİ → CMS GÜNCELLE ───────────────────────
-        # Sadece mevcut göreve ait özellikler kullanılır (replay örnekleri dahil edilmez).
-        # Bu, nested_learning'e sadakati korur: CMS yalnızca mevcut görevi öğrenir.
+        # ─── GEÇİŞ-2: CMS GÜNCELLE (backward'dan sonra — graph artık serbest) ─
+        # backbone_feat: CMS'in kendi GİRİŞİ → CMS bu girişi daha iyi işlemeyi öğrenir
         if run_teach:
-            with torch.no_grad():
-                teach = compute_teach_signal(
-                    features=features[:n_cur],
-                    logits=logits[:n_cur].detach(),
-                    labels=all_lbls[:n_cur],
-                    classifier=model.classifier,
-                )
-            model.update_cms(features[:n_cur], teach)
+            model.update_cms(backbone_feat[:n_cur], teach)
+            # Dağıtık modda CMS parametrelerini tüm node'larda eşitle
+            if cms_sync_fn is not None:
+                cms_sync_fn()
 
         total_loss += cur_loss.item()
 
@@ -129,7 +136,7 @@ def evaluate(model: HOPEModel, loader, device: torch.device) -> float:
     correct, total = 0, 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
-        logits, _ = model(images)
+        logits, _, _ = model(images)
         correct += (logits.argmax(dim=1) == labels).sum().item()
         total += labels.size(0)
     return 100.0 * correct / total if total > 0 else 0.0
@@ -157,7 +164,7 @@ def compute_class_means(
         # Büyük sınıflarda bellek aşımını önlemek için batch'ler halinde işle
         for i in range(0, len(imgs), 64):
             batch = torch.stack(imgs[i : i + 64]).to(device)
-            _, feat = model(batch)
+            _, _, feat = model(batch)  # cms_out kullan → NCM CMS katkısını yansıtır
             feats.append(feat.cpu())
         mean = torch.cat(feats, dim=0).mean(dim=0)  # tüm örneklerin ortalaması
         class_means[cid] = F.normalize(mean, dim=0)  # birim vektör → cosine mesafe için
@@ -193,7 +200,7 @@ def evaluate_ncm(
     correct, total = 0, 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
-        _, features = model(images)                    # (B, 512) — backbone özellikleri
+        _, _, features = model(images)                 # cms_out — CMS katkısını yansıtır
         features = F.normalize(features, dim=1)        # L2 normalize → cosine benzerliği için
         sims = features @ means.T                      # (B, C) — her sınıfa cosine benzerlik skoru
         pred_indices = sims.argmax(dim=1).cpu()        # en yüksek benzerlik indeksi

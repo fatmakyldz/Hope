@@ -41,6 +41,32 @@ class TaskData:
 
 
 # ─── ANA FONKSİYON: TÜM GÖREVLERİ YÜKLE ────────────────────────────────────
+def get_cifar100_task_datasets(root: str = "./data") -> list[dict]:
+    """
+    Dağıtık eğitim için DataLoader yerine ham dataset döndürür.
+
+    Her node kendi DistributedSampler'ını oluşturabilmek için
+    DataLoader değil Subset nesnelerine ihtiyaç duyar.
+
+    Döndürür: [{'task_id', 'class_ids', 'train_subset', 'test_subset'}, ...]
+    """
+    train_ds = datasets.CIFAR100(root=root, train=True,  download=True, transform=TRANSFORM)
+    test_ds  = datasets.CIFAR100(root=root, train=False, download=True, transform=TRANSFORM)
+
+    result = []
+    for task_id, class_ids in enumerate(TASK_CLASSES):
+        class_set = set(class_ids)
+        tr_idx = [i for i, y in enumerate(train_ds.targets) if y in class_set]
+        te_idx = [i for i, y in enumerate(test_ds.targets)  if y in class_set]
+        result.append({
+            "task_id":      task_id,
+            "class_ids":    class_ids,
+            "train_subset": Subset(train_ds, tr_idx),
+            "test_subset":  Subset(test_ds,  te_idx),
+        })
+    return result
+
+
 def get_cifar100_tasks(
     batch_size: int = 64,
     root: str = "./data",
@@ -68,10 +94,9 @@ def get_cifar100_tasks(
         train_loader = DataLoader(
             Subset(train_ds, tr_idx),
             batch_size=batch_size,
-            shuffle=True,       # Her epoch'ta farklı sıra → genelleme iyileşir
-            num_workers=0,      # macOS'ta çok işçi "too many open files" hatasına yol açar
+            shuffle=True,
+            num_workers=0,  # macOS'ta çok işçi "too many open files" hatasına yol açar
         )
-        # Test'te daha büyük batch kullanıyoruz çünkü gradient hesaplanmıyor
         test_loader = DataLoader(
             Subset(test_ds, te_idx),
             batch_size=256,

@@ -80,19 +80,21 @@ class HOPEModel(nn.Module):
         # 512 boyutlu CMS çıkışını 100 sınıfa eşleyen lineer katman
         self.classifier = nn.Linear(self.backbone.feature_dim, num_classes)
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """
-        İleri geçiş — iki değer döndürür:
-          logits  : (B, num_classes) — sınıf skorları (sınıflandırıcı çıkışı)
-          features: (B, 512)         — backbone çıkışı (öğretme sinyali için gerekli)
+        İleri geçiş — üç değer döndürür:
+          logits       : (B, num_classes) — sınıf skorları
+          backbone_feat: (B, dim)         — ham backbone özellikleri (CMS update için)
+          cms_out      : (B, dim)         — CMS çıkışı (NCM değerlendirmesi için)
 
-        Not: features backbone çıkışıdır, CMS çıkışı değil.
-        Bu sayede öğretme sinyali hesaplanırken CMS'nin kendi gradyanları karışmaz.
+        İki ayrı özellik döndürme nedeni:
+        - CMS update backbone özelliğini INPUT olarak alır (kendi girişini öğrenir)
+        - NCM cms_out ile yapılır ki CMS'in katkısı değerlendirmeye yansısın
         """
-        features = self.backbone(x)      # (B, 512) — ham görüntü özellikleri
-        cms_out = self.cms(features)     # (B, 512) — bellek dönüşümü uygulanmış özellikler
-        logits = self.classifier(cms_out) # (B, 100) — sınıf skorları
-        return logits, features
+        backbone_feat = self.backbone(x)       # (B, dim) — ham backbone özellikleri
+        cms_out = self.cms(backbone_feat)      # (B, dim) — CMS dönüşümü uygulanmış
+        logits = self.classifier(cms_out)      # (B, 100) — sınıf skorları
+        return logits, backbone_feat, cms_out
 
     def update_cms(self, features: Tensor, teach: Tensor) -> None:
         """Geçiş-2: öğretme sinyaliyle CMS hızlı ağırlıklarını günceller."""

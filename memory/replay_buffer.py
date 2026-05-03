@@ -37,15 +37,17 @@ class CalibrationBuffer:
         self.samples_per_class = samples_per_class
         # sınıf_id → görüntü listesi eşlemesi
         self._store: dict[int, list[Tensor]] = {}
+        # DÜZELTİLDİ: sınıf başına kaç örnek görüldüğünü say (k/n için gerekli)
+        self._seen: dict[int, int] = {}
 
     def add(self, images: Tensor, labels: Tensor) -> None:
         """
-        Bir batch görüntüyü buffer'a ekler (reservoir sampling ile).
+        Bir batch görüntüyü buffer'a ekler (doğru reservoir sampling ile).
 
-        Reservoir sampling garantisi:
-        - Buffer dolmadan önce: her örnek eklenir
-        - Buffer dolduktan sonra: yeni örnek, mevcut örneklerden birinin
-          yerine 1/(spc+1) olasılıkla geçer → tüm örnekler eşit olasılıkla temsil edilir
+        Doğru reservoir sampling garantisi:
+        - İlk k örnek: direkt eklenir
+        - n. örnek (n > k): k/n olasılıkla buffer'daki rastgele bir yeri geçer
+        → Her örnek eşit olasılıkla (k/toplam) temsil edilir, yeni/eski bias yok.
 
         CPU'da saklanır (GPU belleği tasarrufu için).
         """
@@ -53,14 +55,18 @@ class CalibrationBuffer:
             cid = int(lbl.item())
             if cid not in self._store:
                 self._store[cid] = []
+                self._seen[cid] = 0
             buf = self._store[cid]
+            self._seen[cid] += 1
+            n = self._seen[cid]  # bu sınıf için şimdiye kadar görülen toplam örnek
 
             if len(buf) < self.samples_per_class:
                 # Buffer dolmamış: direkt ekle
                 buf.append(img.clone())
             else:
-                # Buffer dolu: rastgele bir yere üzerine yaz (reservoir sampling)
-                idx = random.randint(0, self.samples_per_class)
+                # DÜZELTİLDİ: k/n olasılığıyla kabul et (n büyüdükçe olasılık azalır)
+                # Önceki kod: random.randint(0, k) → sabit k/(k+1) olasılık → yeni örneklere bias
+                idx = random.randint(0, n - 1)
                 if idx < self.samples_per_class:
                     buf[idx] = img.clone()
 

@@ -105,9 +105,11 @@ def main() -> None:
     print("=" * 60)
     print("  HOPE-CIFAR -- Continual Learning")
     print("=" * 60)
+    classes_per_task = 2 if args.dataset == "cifar10" else 10
     print(f"  Donanim        : {device}")
+    print(f"  Dataset        : {args.dataset.upper()}")
     print(f"  Backbone       : {args.backbone.upper()}")
-    print(f"  Gorevler       : {args.num_tasks} x 10 sinif")
+    print(f"  Gorevler       : {args.num_tasks} x {classes_per_task} sinif")
     print(f"  Epoch/gorev    : {args.epochs}")
     print(f"  Backbone donuk : {args.freeze_backbone}")
     print(f"  Onceden egit.  : {not args.no_pretrained}")

@@ -31,7 +31,7 @@ import sys
 
 import torch
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     # Eğitim hiperparametreleri
     p.add_argument("--dataset",           type=str,   default="cifar100", choices=["cifar100", "cifar10"])
     p.add_argument("--epochs",           type=int,   default=15,   help="Her görev için epoch sayısı")
-    p.add_argument("--batch_size",       type=int,   default=128,  help="GPU'ya sığan batch boyutu")
+    p.add_argument("--batch_size",       type=int,   default=48,   help="GPU'ya sığan batch boyutu (ViT T4: 48)")
     p.add_argument("--accum_steps",      type=int,   default=1,    help="Gradient accumulation adımı")
     p.add_argument("--num_tasks",        type=int,   default=None)
     # Optimizer
@@ -142,7 +142,7 @@ def train_one_epoch_gpu(
             buffer.add(images, labels)
 
         # ─── FORWARD (fp16) ───────────────────────────────────────────────────
-        with autocast(enabled=use_amp):
+        with autocast("cuda", enabled=use_amp):
             logits, backbone_feat, cms_out = model(all_imgs)
             cur_loss = F.cross_entropy(logits[:n_cur], all_lbls[:n_cur])
             if all_imgs.size(0) > n_cur:
@@ -277,7 +277,7 @@ def main() -> None:
         ),
         weight_decay=args.weight_decay,
     )
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler("cuda", enabled=use_amp)
 
     # ─── SÜREKLİ ÖĞRENME DÖNGÜSÜ ─────────────────────────────────────────────
     metrics       = ContinualMetrics(num_tasks=num_tasks)
@@ -287,6 +287,7 @@ def main() -> None:
 
     for task in tasks[:num_tasks]:
         seen_classes.extend(task.class_ids)
+        torch.cuda.empty_cache()
 
         print(f"\n{'='*60}")
         print(f"  Gorev {task.task_id}  |  Siniflar {task.class_ids[0]}-{task.class_ids[-1]}")
@@ -321,9 +322,9 @@ def main() -> None:
         # ─── GAUSSIAN KALİBRASYON ─────────────────────────────────────────────
         if gaussian_buffer is not None:
             print(f"  Gaussian istatistikleri guncelleniyor ({len(seen_classes)} sinif)...")
-            # Backbone fine-tune sonrası feature space değişti → TÜM görülen sınıflar yeniden hesaplanmalı
             for prev_task in tasks[:task.task_id + 1]:
                 gaussian_buffer.update(model, prev_task.train_loader, device, prev_task.class_ids)
+                torch.cuda.empty_cache()
             print(f"  Siniflandirici kalibre ediliyor (epoch={args.align_epochs})...")
             classifier_align(
                 classifier=model.classifier,

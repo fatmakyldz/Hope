@@ -95,7 +95,8 @@ class ViTBackbone(nn.Module):
             n = x.shape[0]
             batch_class_token = vit.class_token.expand(n, -1, -1)
             x = torch.cat([batch_class_token, x], dim=1)
-            x = checkpoint_sequential(vit.encoder.layers, segments=4, input=x)
+            x = checkpoint_sequential(vit.encoder.layers, segments=4, input=x,
+                                          use_reentrant=False)
             x = vit.encoder.ln(x)
             return x[:, 0]  # CLS token
         return self.vit(x)

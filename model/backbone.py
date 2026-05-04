@@ -12,7 +12,9 @@ Bu dosyada iki backbone seçeneği bulunmaktadır:
    - CLS token özellik vektörü olarak alınır (tüm patch'lerin özeti).
    - Standart ResNet'e göre daha zengin global bağlam bilgisi taşır.
 """
+import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint_sequential
 from torchvision import models
 
 
@@ -68,19 +70,17 @@ class ViTBackbone(nn.Module):
     - Daha zengin temsil: 768 boyut vs ResNet18'in 512 boyutu
     """
 
-    def __init__(self, pretrained: bool = True, freeze: bool = False):
+    def __init__(self, pretrained: bool = True, freeze: bool = False,
+                 grad_checkpoint: bool = False):
         super().__init__()
 
-        # IMAGENET1K_V1: ImageNet üzerinde eğitilmiş ağırlıklar
         weights = models.ViT_B_16_Weights.IMAGENET1K_V1 if pretrained else None
         vit = models.vit_b_16(weights=weights)
-
-        # Sınıflandırma kafasını kaldır (768→1000), Identity ile değiştir.
-        # Böylece forward() çıkışı doğrudan 768 boyutlu CLS token olur.
         vit.heads = nn.Identity()
 
         self.vit = vit
-        self.feature_dim = 768  # ViT-B'nin CLS token boyutu
+        self.feature_dim = 768
+        self.grad_checkpoint = grad_checkpoint
 
         if freeze:
             for p in self.parameters():
@@ -88,4 +88,14 @@ class ViTBackbone(nn.Module):
 
     def forward(self, x):
         # (B, 3, 224, 224) → (B, 768)
+        if self.grad_checkpoint and self.training:
+            # Encoder katmanlarını checkpoint_sequential ile sar → ~3x bellek tasarrufu
+            vit = self.vit
+            x = vit._process_input(x)
+            n = x.shape[0]
+            batch_class_token = vit.class_token.expand(n, -1, -1)
+            x = torch.cat([batch_class_token, x], dim=1)
+            x = checkpoint_sequential(vit.encoder.layers, segments=4, input=x)
+            x = vit.encoder.ln(x)
+            return x[:, 0]  # CLS token
         return self.vit(x)

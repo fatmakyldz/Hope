@@ -70,10 +70,12 @@ class HOPEModel(nn.Module):
         backbone_type: str = "resnet",
         cms_hidden_multiplier: int = 4,
         cms_grad_clip: float = 1.0,
+        grad_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         if backbone_type == "vit":
-            self.backbone = ViTBackbone(pretrained=pretrained, freeze=freeze_backbone)
+            self.backbone = ViTBackbone(pretrained=pretrained, freeze=freeze_backbone,
+                                        grad_checkpoint=grad_checkpoint)
         else:
             self.backbone = ResNetBackbone(pretrained=pretrained, freeze=freeze_backbone)
         self.cms = CMSModule(

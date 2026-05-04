@@ -74,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_teach",         action="store_true")
     p.add_argument("--reset_all_cms",    action="store_true")
     p.add_argument("--no_amp",           action="store_true", help="Mixed precision kapat (debug için)")
+    p.add_argument("--grad_checkpoint",  action="store_true", help="ViT gradient checkpointing (OOM önleme)")
     # Replay
     p.add_argument("--replay",           action="store_true")
     p.add_argument("--samples_per_class",type=int,   default=100)
@@ -263,6 +264,7 @@ def main() -> None:
         pretrained=not args.no_pretrained,
         freeze_backbone=args.freeze_backbone,
         backbone_type=args.backbone,
+        grad_checkpoint=args.grad_checkpoint,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())

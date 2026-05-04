@@ -201,6 +201,7 @@ def _mask_classifier_grads_gpu(classifier, allowed_class_ids, device):
 
 # ─── ANA FONKSİYON ───────────────────────────────────────────────────────────
 def main() -> None:
+    import platform
     args = parse_args()
     torch.manual_seed(args.seed)
 
@@ -209,6 +210,9 @@ def main() -> None:
         print("[UYARI] CUDA bulunamadı! train.py (CPU/MPS) kullanın.")
         print("        Bu script NVIDIA GPU gerektiriyor.")
         sys.exit(1)
+
+    # Windows'ta num_workers > 0 spawn sorununa yol açabilir
+    num_workers = 0 if platform.system() == "Windows" else 2
 
     device = torch.device("cuda")
     # cuDNN sabit-boyutlu input için en hızlı konvolüsyon algoritmasını seç
@@ -255,7 +259,8 @@ def main() -> None:
     vit_tf = CIFAR10_VIT_TRANSFORM if is_cifar10 else CIFAR100_VIT_TRANSFORM
     data_transform = vit_tf if args.backbone == "vit" else None
     loader_args = dict(batch_size=args.batch_size, root=args.data_dir,
-                       num_workers=2, transform=data_transform, pin_memory=True)
+                       num_workers=num_workers, transform=data_transform,
+                       pin_memory=(num_workers > 0))
     tasks = get_cifar10_tasks(**loader_args) if is_cifar10 else get_cifar100_tasks(**loader_args)
 
     # ─── MODEL OLUŞTURMA ──────────────────────────────────────────────────────

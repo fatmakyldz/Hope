@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .backbone import ResNetBackbone
+from .backbone import ResNetBackbone, ViTBackbone
 from .cms import CMSModule
 
 
@@ -67,11 +67,15 @@ class HOPEModel(nn.Module):
         num_classes: int = 100,
         pretrained: bool = True,
         freeze_backbone: bool = False,
+        backbone_type: str = "resnet",
         cms_hidden_multiplier: int = 4,
         cms_grad_clip: float = 1.0,
     ) -> None:
         super().__init__()
-        self.backbone = ResNetBackbone(pretrained=pretrained, freeze=freeze_backbone)
+        if backbone_type == "vit":
+            self.backbone = ViTBackbone(pretrained=pretrained, freeze=freeze_backbone)
+        else:
+            self.backbone = ResNetBackbone(pretrained=pretrained, freeze=freeze_backbone)
         self.cms = CMSModule(
             dim=self.backbone.feature_dim,
             hidden_multiplier=cms_hidden_multiplier,

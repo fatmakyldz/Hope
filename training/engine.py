@@ -178,6 +178,7 @@ def evaluate_ncm(
     loader,
     device: torch.device,
     class_means: dict[int, Tensor],
+    use_backbone: bool = False,
 ) -> float:
     """
     Nearest Class Mean (En Yakın Sınıf Ortalaması) değerlendirmesi.
@@ -200,7 +201,8 @@ def evaluate_ncm(
     correct, total = 0, 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
-        _, _, features = model(images)                 # cms_out — CMS katkısını yansıtır
+        _, backbone_feat, cms_out = model(images)
+        features = backbone_feat if use_backbone else cms_out
         features = F.normalize(features, dim=1)        # L2 normalize → cosine benzerliği için
         sims = features @ means.T                      # (B, C) — her sınıfa cosine benzerlik skoru
         pred_indices = sims.argmax(dim=1).cpu()        # en yüksek benzerlik indeksi

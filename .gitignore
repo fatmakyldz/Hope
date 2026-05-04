@@ -19,8 +19,10 @@ data/cifar-100-python/
 data/cifar-100-python.tar.gz
 data/*.tar.gz
 
-# Results (large experiment outputs)
+# Results and checkpoints
 results/
+checkpoints/
+checkpoints_smoke/
 
 # macOS
 .DS_Store

@@ -22,6 +22,14 @@ TRANSFORM = transforms.Compose([
                          (0.2675, 0.2565, 0.2761)),   # RGB kanal std'leri
 ])
 
+# ViT-B/16 için: 224×224 + ImageNet normalizasyonu
+VIT_TRANSFORM = transforms.Compose([
+    transforms.Resize(224),
+    transforms.ToTensor(),
+    transforms.Normalize((0.485, 0.456, 0.406),   # ImageNet ortalamaları
+                         (0.229, 0.224, 0.225)),   # ImageNet std'leri
+])
+
 # ─── GÖREV TANIMI ────────────────────────────────────────────────────────────
 # 100 sınıfı 10 göreve bölen liste.
 # Görev 0: sınıf 0-9, Görev 1: sınıf 10-19, ... Görev 9: sınıf 90-99
@@ -71,6 +79,8 @@ def get_cifar100_tasks(
     batch_size: int = 64,
     root: str = "./data",
     num_workers: int = 2,
+    transform=None,
+    pin_memory: bool = False,
 ) -> list[TaskData]:
     """
     CIFAR-100'ü indirip 10 göreve böler ve her görev için DataLoader döndürür.
@@ -79,8 +89,9 @@ def get_cifar100_tasks(
     Subset alır — veri iki kez yüklenmez, bellek tasarrufu sağlanır.
     """
     # Tüm veriyi bir kez yükle
-    train_ds = datasets.CIFAR100(root=root, train=True,  download=True, transform=TRANSFORM)
-    test_ds  = datasets.CIFAR100(root=root, train=False, download=True, transform=TRANSFORM)
+    t = transform if transform is not None else TRANSFORM
+    train_ds = datasets.CIFAR100(root=root, train=True,  download=True, transform=t)
+    test_ds  = datasets.CIFAR100(root=root, train=False, download=True, transform=t)
 
     tasks = []
     for task_id, class_ids in enumerate(TASK_CLASSES):
@@ -95,13 +106,15 @@ def get_cifar100_tasks(
             Subset(train_ds, tr_idx),
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0,  # macOS'ta çok işçi "too many open files" hatasına yol açar
+            num_workers=num_workers,
+            pin_memory=pin_memory,
         )
         test_loader = DataLoader(
             Subset(test_ds, te_idx),
             batch_size=256,
             shuffle=False,
-            num_workers=0,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
         )
         tasks.append(TaskData(task_id, class_ids, train_loader, test_loader))
     return tasks

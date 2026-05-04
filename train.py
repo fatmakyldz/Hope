@@ -2,27 +2,13 @@
 """
 HOPE-CIFAR — CIFAR-100 Sürekli Öğrenme (Continual Learning) Ana Scripti
 
-Bu script, HOPE mimarisini CIFAR-100 üzerinde çalıştırır.
-100 sınıf, 10 göreve bölünmüştür (her görevde 10 yeni sınıf).
-
-─── MİMARİ ───────────────────────────────────────────────────────────────────
-  ResNet18 (ImageNet önceden eğitilmiş)
-    ↓ 512 boyutlu özellik vektörü
-  4 Kademeli CMS (fast → mid → slow → ultra)
-    ↓ 512 boyutlu dönüştürülmüş özellik
-  Lineer Sınıflandırıcı (512 → 100 sınıf)
-
-─── STANDART YÖNTEMLERDEN FARKI ─────────────────────────────────────────────
-  1. CMS: Hızlı/yavaş bellek hiyerarşisi ile unutmayı engeller
-  2. Öğretme Sinyali: Kapalı-form CE gradyanı (backprop yerine)
-  3. NCM Değerlendirme: Softmax kaymasına karşı bağışıklıklı tahmin
-  4. Kalibrasyon Replay: Minimal buffer (sınıflandırıcı kalibrasyonu için)
-
 ─── KULLANIM ─────────────────────────────────────────────────────────────────
-  python train.py                        # varsayılan ayarlar
-  python train.py --freeze_backbone      # backbone dondurulmuş
-  python train.py --replay               # replay buffer etkin
-  python train.py --no_teach             # teach signal ablasyonu
+  python train.py                                      # ResNet18, varsayılan
+  python train.py --gaussian_align                     # Gaussian kalibrasyon ekle
+  python train.py --gaussian_align --cosface           # CosFace ile birlikte
+  python train.py --backbone vit --gaussian_align      # ViT-B/16 (lab için)
+  python train.py --freeze_backbone                    # backbone dondurulmuş
+  python train.py --no_teach                           # teach signal ablasyonu
 """
 from __future__ import annotations
 
@@ -37,9 +23,11 @@ import torch.optim as optim
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from data.cifar100 import get_cifar100_tasks
+from data.cifar100 import VIT_TRANSFORM, get_cifar100_tasks
+from memory.gaussian_buffer import GaussianBuffer
 from memory.replay_buffer import CalibrationBuffer
 from model.hope_model import HOPEModel
+from training.classifier_align import classifier_align
 from training.engine import compute_class_means, evaluate, evaluate_ncm, train_one_epoch
 from utils.metrics import ContinualMetrics
 
@@ -56,8 +44,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--classifier_lr",    type=float, default=1e-3, help="Sınıflandırıcı öğrenme hızı")
     p.add_argument("--weight_decay",     type=float, default=1e-4)
     # Backbone seçenekleri
+    p.add_argument("--backbone",         type=str,   default="resnet", choices=["resnet", "vit"],
+                                         help="Backbone tipi: resnet (Mac/hızlı) veya vit (lab/güçlü)")
     p.add_argument("--freeze_backbone",  action="store_true", help="Backbone ağırlıklarını dondur")
     p.add_argument("--no_pretrained",    action="store_true", help="ImageNet ağırlıkları kullanma")
+    # Gaussian Classifier Alignment (TUNA'dan uyarlanmış)
+    p.add_argument("--gaussian_align",   action="store_true", help="Gaussian kalibrasyon etkinleştir")
+    p.add_argument("--align_epochs",     type=int,   default=30,  help="Kalibrasyon epoch sayısı")
+    p.add_argument("--cosface",          action="store_true", help="CosFace loss kullan (cosine + margin)")
+    p.add_argument("--cosface_scale",    type=float, default=20.0, help="CosFace ölçek faktörü")
     # Ablasyon bayrakları (HOPE bileşenlerini tek tek kapatmak için)
     p.add_argument("--no_teach",         action="store_true", help="Öğretme sinyalini devre dışı bırak")
     p.add_argument("--reset_all_cms",    action="store_true", help="Görev sınırında TÜM CMS kademelerini sıfırla")
@@ -91,9 +86,13 @@ def main() -> None:
 
     # Sonuç dizini: zaman damgalı, her çalıştırma için ayrı klasör
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    tag = f"cifar100_t{args.num_tasks}_e{args.epochs}"
+    tag = f"cifar100_t{args.num_tasks}_e{args.epochs}_{args.backbone}"
     if args.freeze_backbone:
         tag += "_frozen"
+    if args.gaussian_align:
+        tag += "_galign"
+        if args.cosface:
+            tag += "_cosface"
     result_dir = os.path.join(args.results_dir, f"{tag}_{ts}")
     os.makedirs(result_dir, exist_ok=True)
 
@@ -102,6 +101,7 @@ def main() -> None:
     print("  HOPE-CIFAR -- Continual Learning")
     print("=" * 60)
     print(f"  Donanim        : {device}")
+    print(f"  Backbone       : {args.backbone.upper()}")
     print(f"  Gorevler       : {args.num_tasks} x 10 sinif")
     print(f"  Epoch/gorev    : {args.epochs}")
     print(f"  Backbone donuk : {args.freeze_backbone}")
@@ -110,14 +110,18 @@ def main() -> None:
     print(f"  CMS kademeleri : fast(1) mid(4) slow(32) ultra(128)")
     replay_str = f"ACIK (spc={args.samples_per_class}, w={args.replay_weight})" if args.replay else "KAPALI"
     print(f"  Replay buffer  : {replay_str}")
+    align_str = f"ACIK (epochs={args.align_epochs}, cosface={args.cosface})" if args.gaussian_align else "KAPALI"
+    print(f"  Gaussian align : {align_str}")
     print("=" * 60)
 
     # ─── VERİ YÜKLEME ─────────────────────────────────────────────────────────
-    # 10 görev × 10 sınıf = 100 sınıf, sıralı olarak sunulur
+    # ViT 224×224 gerektirir; ResNet 32×32 CIFAR transform kullanır
+    data_transform = VIT_TRANSFORM if args.backbone == "vit" else None
     tasks = get_cifar100_tasks(
         batch_size=args.batch_size,
         root=args.data_dir,
-        num_workers=2,
+        num_workers=0,     # macOS: çok worker "too many open files" hatasına yol açar
+        transform=data_transform,
     )
 
     # ─── MODEL OLUŞTURMA ──────────────────────────────────────────────────────
@@ -125,6 +129,7 @@ def main() -> None:
         num_classes=100,
         pretrained=not args.no_pretrained,
         freeze_backbone=args.freeze_backbone,
+        backbone_type=args.backbone,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -148,8 +153,8 @@ def main() -> None:
 
     # ─── SÜREKLİ ÖĞRENME DÖNGÜSÜ ─────────────────────────────────────────────
     metrics = ContinualMetrics(num_tasks=args.num_tasks)
-    # Replay buffer: sınıflandırıcı kalibrasyonu için eski görev örneklerini saklar
     buffer = CalibrationBuffer(samples_per_class=args.samples_per_class) if args.replay else None
+    gaussian_buffer = GaussianBuffer() if args.gaussian_align else None
     seen_classes: list[int] = []  # şimdiye kadar görülen tüm sınıf IDleri
 
     for task in tasks[:args.num_tasks]:
@@ -184,24 +189,48 @@ def main() -> None:
         else:
             model.on_task_boundary()  # sadece fast + mid sıfırla
 
+        # ─── GAUSSIAN KALİBRASYON ─────────────────────────────────────────────
+        # CMS sıfırlandıktan sonra backbone özellikleri kararlı kalır.
+        # Gaussian dağılımları backbone özelliklerinden hesaplanır,
+        # ardından sınıflandırıcı bu sentetik özelliklerle yeniden kalibre edilir.
+        if gaussian_buffer is not None:
+            print(f"  Gaussian istatistikleri guncelleniyor ({len(seen_classes)} sinif)...")
+            # Backbone fine-tune sonrası feature space değişti → TÜM görülen sınıflar yeniden hesaplanmalı
+            for prev_task in tasks[:task.task_id + 1]:
+                gaussian_buffer.update(model, prev_task.train_loader, device, prev_task.class_ids)
+            print(f"  Siniflandirici kalibre ediliyor (epoch={args.align_epochs})...")
+            classifier_align(
+                classifier=model.classifier,
+                gaussian_buffer=gaussian_buffer,
+                device=device,
+                epochs=args.align_epochs,
+                lr=0.005,
+                n_per_class=256,
+                scale=args.cosface_scale,
+                cosface=args.cosface,
+            )
+            print(f"  Kalibrasyon tamamlandi.")
+
         # ─── NCM İÇİN SINIF ORTALAMALARINI HESAPLA ───────────────────────────
-        # Buffer'daki görüntüler üzerinde model çalıştırılarak her sınıfın
-        # ortalama özellik vektörü hesaplanır. Bu vektörler test zamanında
-        # softmax yerine mesafe hesabı için kullanılır.
-        if buffer is not None:
+        if gaussian_buffer is not None:
+            # Gaussian buffer'dan backbone özellik ortalamaları al
+            class_means = gaussian_buffer.get_class_means()
+        elif buffer is not None:
             class_means = compute_class_means(model, buffer, device)
         else:
             class_means = None
 
         # ─── TÜM GÖRÜLEN GÖREVLERİ DEĞERLENDİR ──────────────────────────────
-        # Sürekli öğrenmede başarı: hem yeni görevi öğrenmek hem eski görevleri
-        # hatırlamak. Her görev sonunda tüm önceki görevler de test edilir.
         print(f"\n  Gorev {task.task_id} sonrasi degerlendirme:")
         accs = []
         for prev_task in tasks[:task.task_id + 1]:
             if class_means is not None:
                 # NCM: softmax kaymasına karşı bağışıklıklı değerlendirme
-                acc = evaluate_ncm(model, prev_task.test_loader, device, class_means)
+                # Gaussian buffer kullanıyorsa backbone özellikleriyle karşılaştır
+                acc = evaluate_ncm(
+                    model, prev_task.test_loader, device, class_means,
+                    use_backbone=(gaussian_buffer is not None),
+                )
             else:
                 # Standart softmax değerlendirme
                 acc = evaluate(model, prev_task.test_loader, device)

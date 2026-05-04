@@ -35,7 +35,10 @@ from torch.cuda.amp import GradScaler, autocast
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from data.cifar100 import VIT_TRANSFORM, get_cifar100_tasks
+from data.cifar100 import VIT_TRANSFORM as CIFAR100_VIT_TRANSFORM
+from data.cifar100 import get_cifar100_tasks
+from data.cifar10 import VIT_TRANSFORM as CIFAR10_VIT_TRANSFORM
+from data.cifar10 import get_cifar10_tasks
 from memory.gaussian_buffer import GaussianBuffer
 from memory.replay_buffer import CalibrationBuffer
 from model.hope_model import HOPEModel
@@ -48,10 +51,11 @@ from utils.metrics import ContinualMetrics
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HOPE-CIFAR GPU Eğitimi")
     # Eğitim hiperparametreleri
+    p.add_argument("--dataset",           type=str,   default="cifar100", choices=["cifar100", "cifar10"])
     p.add_argument("--epochs",           type=int,   default=15,   help="Her görev için epoch sayısı")
     p.add_argument("--batch_size",       type=int,   default=128,  help="GPU'ya sığan batch boyutu")
-    p.add_argument("--accum_steps",      type=int,   default=1,    help="Gradient accumulation adımı (etkili batch = batch_size × accum_steps)")
-    p.add_argument("--num_tasks",        type=int,   default=10)
+    p.add_argument("--accum_steps",      type=int,   default=1,    help="Gradient accumulation adımı")
+    p.add_argument("--num_tasks",        type=int,   default=None)
     # Optimizer
     p.add_argument("--backbone_lr",      type=float, default=1e-4)
     p.add_argument("--classifier_lr",    type=float, default=1e-3)
@@ -213,8 +217,13 @@ def main() -> None:
     effective_batch = args.batch_size * args.accum_steps
 
     # ─── SONUÇ DİZİNİ ─────────────────────────────────────────────────────────
+    is_cifar10  = (args.dataset == "cifar10")
+    num_classes = 10 if is_cifar10 else 100
+    max_tasks   = 5  if is_cifar10 else 10
+    num_tasks   = args.num_tasks if args.num_tasks is not None else max_tasks
+
     ts  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    tag = f"gpu_{args.backbone}_t{args.num_tasks}_e{args.epochs}_b{effective_batch}"
+    tag = f"gpu_{args.dataset}_{args.backbone}_t{num_tasks}_e{args.epochs}_b{effective_batch}"
     if args.gaussian_align:
         tag += "_galign"
         if args.cosface:
@@ -229,7 +238,9 @@ def main() -> None:
     print("=" * 60)
     print(f"  GPU            : {gpu_name}")
     print(f"  Backbone       : {args.backbone.upper()}")
-    print(f"  Gorevler       : {args.num_tasks} x 10 sinif")
+    classes_per_task = 2 if is_cifar10 else 10
+    print(f"  Dataset        : {args.dataset.upper()}")
+    print(f"  Gorevler       : {num_tasks} x {classes_per_task} sinif")
     print(f"  Epoch/gorev    : {args.epochs}")
     print(f"  Batch boyutu   : {args.batch_size} x {args.accum_steps} adim = {effective_batch} efektif")
     print(f"  Mixed Precision: {'ACIK (fp16)' if use_amp else 'KAPALI (fp32)'}")
@@ -240,19 +251,15 @@ def main() -> None:
     print("=" * 60)
 
     # ─── VERİ YÜKLEME ─────────────────────────────────────────────────────────
-    data_transform = VIT_TRANSFORM if args.backbone == "vit" else None
-    # GPU'da pin_memory=True: sayfalı bellek → DMA transferi → hız artışı
-    tasks = get_cifar100_tasks(
-        batch_size=args.batch_size,
-        root=args.data_dir,
-        num_workers=4,          # GPU sunucularında 4-8 worker mantıklı
-        transform=data_transform,
-        pin_memory=True,        # CPU→GPU transfer için
-    )
+    vit_tf = CIFAR10_VIT_TRANSFORM if is_cifar10 else CIFAR100_VIT_TRANSFORM
+    data_transform = vit_tf if args.backbone == "vit" else None
+    loader_args = dict(batch_size=args.batch_size, root=args.data_dir,
+                       num_workers=2, transform=data_transform, pin_memory=True)
+    tasks = get_cifar10_tasks(**loader_args) if is_cifar10 else get_cifar100_tasks(**loader_args)
 
     # ─── MODEL OLUŞTURMA ──────────────────────────────────────────────────────
     model = HOPEModel(
-        num_classes=100,
+        num_classes=num_classes,
         pretrained=not args.no_pretrained,
         freeze_backbone=args.freeze_backbone,
         backbone_type=args.backbone,
@@ -273,12 +280,12 @@ def main() -> None:
     scaler = GradScaler(enabled=use_amp)
 
     # ─── SÜREKLİ ÖĞRENME DÖNGÜSÜ ─────────────────────────────────────────────
-    metrics       = ContinualMetrics(num_tasks=args.num_tasks)
+    metrics       = ContinualMetrics(num_tasks=num_tasks)
     buffer        = CalibrationBuffer(samples_per_class=args.samples_per_class) if args.replay else None
     gaussian_buffer = GaussianBuffer() if args.gaussian_align else None
     seen_classes: list[int] = []
 
-    for task in tasks[:args.num_tasks]:
+    for task in tasks[:num_tasks]:
         seen_classes.extend(task.class_ids)
 
         print(f"\n{'='*60}")

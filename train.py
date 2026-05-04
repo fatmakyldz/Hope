@@ -23,7 +23,10 @@ import torch.optim as optim
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from data.cifar100 import VIT_TRANSFORM, get_cifar100_tasks
+from data.cifar100 import VIT_TRANSFORM as CIFAR100_VIT_TRANSFORM
+from data.cifar100 import get_cifar100_tasks
+from data.cifar10 import VIT_TRANSFORM as CIFAR10_VIT_TRANSFORM
+from data.cifar10 import get_cifar10_tasks
 from memory.gaussian_buffer import GaussianBuffer
 from memory.replay_buffer import CalibrationBuffer
 from model.hope_model import HOPEModel
@@ -36,9 +39,11 @@ from utils.metrics import ContinualMetrics
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HOPE-CIFAR Continual Learning")
     # Eğitim hiperparametreleri
+    p.add_argument("--dataset",           type=str,   default="cifar100", choices=["cifar100", "cifar10"],
+                                         help="cifar100: 10 gorev x 10 sinif | cifar10: 5 gorev x 2 sinif")
     p.add_argument("--epochs",           type=int,   default=10,  help="Her görev için epoch sayısı")
     p.add_argument("--batch_size",       type=int,   default=64)
-    p.add_argument("--num_tasks",        type=int,   default=10,  help="Toplam görev sayısı (max 10)")
+    p.add_argument("--num_tasks",        type=int,   default=None, help="Varsayilan: dataset maksimumu")
     # Optimizer ayarları
     p.add_argument("--backbone_lr",      type=float, default=1e-4, help="Backbone öğrenme hızı (küçük tutulmalı)")
     p.add_argument("--classifier_lr",    type=float, default=1e-3, help="Sınıflandırıcı öğrenme hızı")
@@ -115,18 +120,28 @@ def main() -> None:
     print("=" * 60)
 
     # ─── VERİ YÜKLEME ─────────────────────────────────────────────────────────
-    # ViT 224×224 gerektirir; ResNet 32×32 CIFAR transform kullanır
-    data_transform = VIT_TRANSFORM if args.backbone == "vit" else None
-    tasks = get_cifar100_tasks(
-        batch_size=args.batch_size,
-        root=args.data_dir,
-        num_workers=0,     # macOS: çok worker "too many open files" hatasına yol açar
-        transform=data_transform,
-    )
+    is_cifar10  = (args.dataset == "cifar10")
+    num_classes = 10 if is_cifar10 else 100
+    max_tasks   = 5  if is_cifar10 else 10
+    num_tasks   = args.num_tasks if args.num_tasks is not None else max_tasks
+
+    vit_tf = CIFAR10_VIT_TRANSFORM if is_cifar10 else CIFAR100_VIT_TRANSFORM
+    data_transform = vit_tf if args.backbone == "vit" else None
+
+    if is_cifar10:
+        tasks = get_cifar10_tasks(
+            batch_size=args.batch_size, root=args.data_dir,
+            num_workers=0, transform=data_transform,
+        )
+    else:
+        tasks = get_cifar100_tasks(
+            batch_size=args.batch_size, root=args.data_dir,
+            num_workers=0, transform=data_transform,
+        )
 
     # ─── MODEL OLUŞTURMA ──────────────────────────────────────────────────────
     model = HOPEModel(
-        num_classes=100,
+        num_classes=num_classes,
         pretrained=not args.no_pretrained,
         freeze_backbone=args.freeze_backbone,
         backbone_type=args.backbone,
@@ -152,12 +167,12 @@ def main() -> None:
     )
 
     # ─── SÜREKLİ ÖĞRENME DÖNGÜSÜ ─────────────────────────────────────────────
-    metrics = ContinualMetrics(num_tasks=args.num_tasks)
+    metrics = ContinualMetrics(num_tasks=num_tasks)
     buffer = CalibrationBuffer(samples_per_class=args.samples_per_class) if args.replay else None
     gaussian_buffer = GaussianBuffer() if args.gaussian_align else None
-    seen_classes: list[int] = []  # şimdiye kadar görülen tüm sınıf IDleri
+    seen_classes: list[int] = []
 
-    for task in tasks[:args.num_tasks]:
+    for task in tasks[:num_tasks]:
         # Bu görevin sınıflarını görülen sınıflar listesine ekle
         seen_classes.extend(task.class_ids)
 

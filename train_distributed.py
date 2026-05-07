@@ -174,14 +174,12 @@ def main() -> None:
         grad_checkpoint=args.grad_checkpoint,
     ).to(device)
 
-    # CMS parametreleri DeepMomentum ile .data üzerinden güncellenir (autograd dışı).
-    # requires_grad=False yaparak DDP'nin bunları senkronize etmesini engelliyoruz.
-    for p in model.cms.parameters():
-        p.requires_grad_(False)
-
     if world_size > 1:
+        # find_unused_parameters=True: grad_checkpoint + DDP kombinasyonunda gerekli.
+        # CMS parametreleri forward'da kullanılsa da checkpoint recompute sırasında
+        # DDP bazı parametrelerin grad'ını kaçırabiliyor.
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None,
-                    find_unused_parameters=False)
+                    find_unused_parameters=True)
 
     raw_model: HOPEModel = model.module if world_size > 1 else model
 

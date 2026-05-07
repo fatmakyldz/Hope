@@ -243,6 +243,8 @@ def main() -> None:
         first_epoch = start_epoch if task_id == start_task else 0
         for epoch in range(first_epoch, args.epochs):
             train_sampler.set_epoch(epoch)
+            # cms_sync_fn=None: her batch'te all_reduce DDP backward ile çakışıyor.
+            # CMS senkronu epoch sonunda manuel yapılıyor.
             loss = train_one_epoch(
                 model=model,
                 loader=train_loader,
@@ -253,8 +255,12 @@ def main() -> None:
                 buffer=buffer,
                 replay_batch=args.replay_batch,
                 replay_weight=args.replay_weight,
-                cms_sync_fn=cms_sync,
+                cms_sync_fn=None,
             )
+            # Epoch bittikten sonra CMS senkronu — DDP backward'dan bağımsız
+            if world_size > 1:
+                dist.barrier()
+                cms_sync()
             if is_master:
                 print(f"  Epoch {epoch+1}/{args.epochs} | Kayip: {loss:.4f}")
 

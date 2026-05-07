@@ -174,9 +174,15 @@ def main() -> None:
         grad_checkpoint=args.grad_checkpoint,
     ).to(device)
 
+    # CMS parametreleri DeepMomentum ile .data üzerinden güncellenir (autograd dışı).
+    # requires_grad=False yaparak DDP'nin bunları senkronize etmesini engelliyoruz.
+    # Manuel all_reduce zaten cms_sync() ile yapılıyor.
+    for p in raw_model.cms.parameters():
+        p.requires_grad_(False)
+
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None,
-                    find_unused_parameters=True)
+                    find_unused_parameters=False)
 
     raw_model: HOPEModel = model.module if world_size > 1 else model
 

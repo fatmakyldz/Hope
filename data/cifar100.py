@@ -49,7 +49,7 @@ class TaskData:
 
 
 # ─── ANA FONKSİYON: TÜM GÖREVLERİ YÜKLE ────────────────────────────────────
-def get_cifar100_task_datasets(root: str = "./data") -> list[dict]:
+def get_cifar100_task_datasets(root: str = "./data", transform=None) -> list[dict]:
     """
     Dağıtık eğitim için DataLoader yerine ham dataset döndürür.
 
@@ -58,8 +58,9 @@ def get_cifar100_task_datasets(root: str = "./data") -> list[dict]:
 
     Döndürür: [{'task_id', 'class_ids', 'train_subset', 'test_subset'}, ...]
     """
-    train_ds = datasets.CIFAR100(root=root, train=True,  download=True, transform=TRANSFORM)
-    test_ds  = datasets.CIFAR100(root=root, train=False, download=True, transform=TRANSFORM)
+    t = transform if transform is not None else TRANSFORM
+    train_ds = datasets.CIFAR100(root=root, train=True,  download=True, transform=t)
+    test_ds  = datasets.CIFAR100(root=root, train=False, download=True, transform=t)
 
     result = []
     for task_id, class_ids in enumerate(TASK_CLASSES):

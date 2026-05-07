@@ -92,9 +92,12 @@ def train_one_epoch(
         # ─── ÖĞRETME SİNYALİ HAZIRLA (backward'dan önce W snapshot'ı al) ─────
         # W backward'dan önce klonlanır: logits bu W ile hesaplandı → teach tutarlı.
         # CMS update backward'dan SONRA yapılır → in-place değişiklik graph'ı bozmaz.
+        # DDP sarmalayıcısını geç: model.module varsa onu, yoksa model'i kullan
+        raw = model.module if hasattr(model, "module") else model
+
         if run_teach:
             with torch.no_grad():
-                W_snap = model.classifier.weight.detach().clone()
+                W_snap = raw.classifier.weight.detach().clone()
                 B_cur = backbone_feat[:n_cur].size(0)
                 p = torch.softmax(logits[:n_cur].detach(), dim=-1)
                 p[torch.arange(B_cur, device=p.device), all_lbls[:n_cur]] -= 1.0
@@ -106,16 +109,15 @@ def train_one_epoch(
         loss.backward()
 
         # Gradient maskeleme: sınıflandırıcı sadece görülen sınıflar için güncellenir.
-        _mask_classifier_grads(model.classifier, current_class_ids, device)
+        _mask_classifier_grads(raw.classifier, current_class_ids, device)
 
         # Gradient patlamalarını önlemek için norm kırpma
-        torch.nn.utils.clip_grad_norm_(model.meta_parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(raw.meta_parameters(), max_norm=1.0)
         optimizer.step()
 
         # ─── GEÇİŞ-2: CMS GÜNCELLE (backward'dan sonra — graph artık serbest) ─
-        # backbone_feat: CMS'in kendi GİRİŞİ → CMS bu girişi daha iyi işlemeyi öğrenir
         if run_teach:
-            model.update_cms(backbone_feat[:n_cur], teach)
+            raw.update_cms(backbone_feat[:n_cur], teach)
             # Dağıtık modda CMS parametrelerini tüm node'larda eşitle
             if cms_sync_fn is not None:
                 cms_sync_fn()

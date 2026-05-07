@@ -175,7 +175,8 @@ def main() -> None:
     ).to(device)
 
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None)
+        model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None,
+                    find_unused_parameters=True)
 
     raw_model: HOPEModel = model.module if world_size > 1 else model
 

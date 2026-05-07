@@ -176,8 +176,7 @@ def main() -> None:
 
     # CMS parametreleri DeepMomentum ile .data üzerinden güncellenir (autograd dışı).
     # requires_grad=False yaparak DDP'nin bunları senkronize etmesini engelliyoruz.
-    # Manuel all_reduce zaten cms_sync() ile yapılıyor.
-    for p in raw_model.cms.parameters():
+    for p in model.cms.parameters():
         p.requires_grad_(False)
 
     if world_size > 1:

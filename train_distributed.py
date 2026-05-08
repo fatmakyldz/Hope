@@ -138,6 +138,13 @@ def main() -> None:
     torch.manual_seed(args.seed + rank)
     is_master = (rank == 0)
 
+    def _barrier():
+        if world_size > 1:
+            if torch.cuda.is_available():
+                dist.barrier(device_ids=[local_rank])
+            else:
+                dist.barrier()
+
     if is_master:
         os.makedirs(args.checkpoint_dir, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -175,11 +182,10 @@ def main() -> None:
     ).to(device)
 
     if world_size > 1:
-        # find_unused_parameters=True: grad_checkpoint + DDP kombinasyonunda gerekli.
-        # CMS parametreleri forward'da kullanılsa da checkpoint recompute sırasında
-        # DDP bazı parametrelerin grad'ını kaçırabiliyor.
+        # grad_checkpoint açıkken recompute sırasında DDP param takibini kaybedebilir.
+        # Normal çalışmada False → daha hızlı.
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None,
-                    find_unused_parameters=True)
+                    find_unused_parameters=args.grad_checkpoint)
 
     raw_model: HOPEModel = model.module if world_size > 1 else model
 
@@ -200,7 +206,7 @@ def main() -> None:
         start_task, start_epoch = load_checkpoint(args.resume, raw_model, optimizer, buffer)
         if is_master:
             print(f"[Checkpoint] Gorev {start_task}, Epoch {start_epoch}'den devam ediliyor")
-        dist.barrier()
+        _barrier()
 
     def cms_sync():
         if world_size > 1:
@@ -259,14 +265,14 @@ def main() -> None:
             )
             # Epoch bittikten sonra CMS senkronu — DDP backward'dan bağımsız
             if world_size > 1:
-                dist.barrier()
+                _barrier()
                 cms_sync()
             if is_master:
                 print(f"  Epoch {epoch+1}/{args.epochs} | Kayip: {loss:.4f}")
 
         # ─── GÖREV SINIRI ─────────────────────────────────────────────────────
         if world_size > 1:
-            dist.barrier()
+            _barrier()
 
         if args.reset_all_cms:
             raw_model.cms.reset_all()
@@ -307,7 +313,7 @@ def main() -> None:
             if world_size > 1:
                 for param in raw_model.classifier.parameters():
                     dist.broadcast(param.data, src=0)
-                dist.barrier()
+                _barrier()
 
         # ─── NCM CLASS MEAN'LERİ ──────────────────────────────────────────────
         if gaussian_buffer is not None and is_master:

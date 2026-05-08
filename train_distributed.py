@@ -185,7 +185,7 @@ def main() -> None:
         # grad_checkpoint açıkken recompute sırasında DDP param takibini kaybedebilir.
         # Normal çalışmada False → daha hızlı.
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None,
-                    find_unused_parameters=args.grad_checkpoint)
+                    find_unused_parameters=False)
 
     raw_model: HOPEModel = model.module if world_size > 1 else model
 

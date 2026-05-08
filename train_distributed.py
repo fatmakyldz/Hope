@@ -31,6 +31,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -77,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint_dir",    type=str,   default="./checkpoints")
     p.add_argument("--resume",            type=str,   default=None)
     p.add_argument("--seed",              type=int,   default=42)
+    p.add_argument("--amp",               action="store_true", help="Mixed precision (FP16) eğitim")
     return p.parse_args()
 
 
@@ -198,6 +200,8 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
+    scaler = GradScaler("cuda", enabled=args.amp and torch.cuda.is_available())
+
     buffer         = CalibrationBuffer(samples_per_class=args.samples_per_class) if args.replay else None
     gaussian_buffer = GaussianBuffer() if args.gaussian_align else None
 
@@ -262,6 +266,7 @@ def main() -> None:
                 replay_batch=args.replay_batch,
                 replay_weight=args.replay_weight,
                 cms_sync_fn=None,
+                scaler=scaler,
             )
             # Epoch bittikten sonra CMS senkronu — DDP backward'dan bağımsız
             if world_size > 1:

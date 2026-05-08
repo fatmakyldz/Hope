@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.amp import autocast
 from torch.optim import Optimizer
 
 from model.hope_model import HOPEModel
@@ -40,9 +41,11 @@ def train_one_epoch(
     replay_weight: float = 1.0, # replay kaybının ağırlığı
     dynamic_replay: bool = True, # eski sınıf sayısıyla orantılı replay büyüklüğü
     cms_sync_fn=None,          # dağıtık eğitimde CMS senkronizasyon callback'i
+    scaler=None,               # torch.amp.GradScaler | None — AMP etkinse geçirilir
 ) -> float:
     model.train()
     total_loss = 0.0
+    use_amp = scaler is not None and device.type == "cuda"
 
     # ─── DİNAMİK REPLAY BOYUTU ───────────────────────────────────────────────
     # Görev sayısı arttıkça eski sınıflar için daha fazla replay örneği gerekir.
@@ -77,48 +80,47 @@ def train_one_epoch(
             buffer.add(images, labels)
 
         # ─── GEÇİŞ-1: META İLERİ HESAPLAMA ──────────────────────────────────
-        logits, backbone_feat, cms_out = model(all_imgs)
-
-        # Mevcut görev kaybı (normal ağırlık)
-        cur_loss = F.cross_entropy(logits[:n_cur], all_lbls[:n_cur])
-
-        # Replay kaybı (eski görevler için sınıflandırıcıyı kalibre eder)
-        if all_imgs.size(0) > n_cur:
-            rep_loss = F.cross_entropy(logits[n_cur:], all_lbls[n_cur:])
-            loss = cur_loss + replay_weight * rep_loss
-        else:
-            loss = cur_loss
+        with autocast("cuda", enabled=use_amp):
+            logits, backbone_feat, cms_out = model(all_imgs)
+            cur_loss = F.cross_entropy(logits[:n_cur], all_lbls[:n_cur])
+            if all_imgs.size(0) > n_cur:
+                rep_loss = F.cross_entropy(logits[n_cur:], all_lbls[n_cur:])
+                loss = cur_loss + replay_weight * rep_loss
+            else:
+                loss = cur_loss
 
         # ─── ÖĞRETME SİNYALİ HAZIRLA (backward'dan önce W snapshot'ı al) ─────
-        # W backward'dan önce klonlanır: logits bu W ile hesaplandı → teach tutarlı.
-        # CMS update backward'dan SONRA yapılır → in-place değişiklik graph'ı bozmaz.
-        # DDP sarmalayıcısını geç: model.module varsa onu, yoksa model'i kullan
         raw = model.module if hasattr(model, "module") else model
 
         if run_teach:
             with torch.no_grad():
-                W_snap = raw.classifier.weight.detach().clone()
+                # FP32'e cast: CMS sayısal kararlılık için
+                W_snap = raw.classifier.weight.float().detach().clone()
                 B_cur = backbone_feat[:n_cur].size(0)
-                p = torch.softmax(logits[:n_cur].detach(), dim=-1)
+                p = torch.softmax(logits[:n_cur].float().detach(), dim=-1)
                 p[torch.arange(B_cur, device=p.device), all_lbls[:n_cur]] -= 1.0
                 p = p / B_cur
                 teach = -(p @ W_snap)  # (B, dim) — öğretme yönü
 
         # ─── META GERİ YAYILIM ────────────────────────────────────────────────
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-
-        # Gradient maskeleme: sınıflandırıcı sadece görülen sınıflar için güncellenir.
-        _mask_classifier_grads(raw.classifier, current_class_ids, device)
-
-        # Gradient patlamalarını önlemek için norm kırpma
-        torch.nn.utils.clip_grad_norm_(raw.meta_parameters(), max_norm=1.0)
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)  # clip öncesi unscale zorunlu
+            _mask_classifier_grads(raw.classifier, current_class_ids, device)
+            torch.nn.utils.clip_grad_norm_(raw.meta_parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            _mask_classifier_grads(raw.classifier, current_class_ids, device)
+            torch.nn.utils.clip_grad_norm_(raw.meta_parameters(), max_norm=1.0)
+            optimizer.step()
 
         # ─── GEÇİŞ-2: CMS GÜNCELLE (backward'dan sonra — graph artık serbest) ─
         if run_teach:
-            raw.update_cms(backbone_feat[:n_cur], teach)
-            # Dağıtık modda CMS parametrelerini tüm node'larda eşitle
+            # FP32'e cast: CMS içi autograd.grad sayısal kararlılık için
+            raw.update_cms(backbone_feat[:n_cur].float(), teach)
             if cms_sync_fn is not None:
                 cms_sync_fn()
 
